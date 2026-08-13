@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Webcam intrinsic calibration (Python OpenCV)</title>
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="header">
+        <h1>Webcam intrinsic calibration</h1>
+        <p class="subtitle">
+          Checkerboard capture · Python OpenCV · intrinsic matrix + FOV
+        </p>
+      </header>
+
+      <details class="howto">
+        <summary class="howto-toggle">HOW TO</summary>
+        <div class="howto-body">
+          <ol>
+            <li>
+              If you have a printed board, enter the board’s <em>inner corner</em> counts and square size in
+              mm (or pick an iPhone preset if you use a phone screen board which assumes you are using Lens Pattern app).
+            </li>
+            <li>Start the camera, then begin capture and follow the on-screen pose prompts.</li>
+            <li>
+              Hold the board steady in the guide — the app auto-captures when
+              detection and alignment look good.
+            </li>
+            <li>When you have enough views, compute intrinsics and download the JSON.</li>
+          </ol>
+          <p>
+            For a pre-made checkerboard on an iPhone, download the
+            <strong>Lens Pattern</strong> app. In that app, set the checkerboard
+            size to <strong>5</strong>.
+          </p>
+          <p class="howto-demo">
+            Demo walkthrough (YouTube):
+            <a
+              id="howto-demo-link"
+              href="#"
+              target="_blank"
+              rel="noopener noreferrer"
+              aria-disabled="true"
+            >
+              <!-- TODO: paste demo video URL here -->
+              Coming soon
+            </a>
+          </p>
+        </div>
+      </details>
+
+      <nav class="steps" aria-label="Calibration stages">
+        <button type="button" class="step active" data-stage="setup" id="step-setup">
+          1. Setup
+        </button>
+        <button type="button" class="step" data-stage="capture" id="step-capture" disabled>
+          2. Capture
+        </button>
+        <button type="button" class="step" data-stage="results" id="step-results" disabled>
+          3. Results
+        </button>
+      </nav>
+
+      <section class="stage">
+        <div class="video-wrap">
+          <video id="webcam" playsinline autoplay muted></video>
+          <canvas id="overlay"></canvas>
+          <div id="pose-prompt" class="pose-prompt" hidden role="status" aria-live="polite"></div>
+          <div id="stage-badge" class="stage-badge idle" aria-live="polite">
+            Enter checkerboard size, then start the camera
+          </div>
+        </div>
+
+        <aside class="panel">
+          <label class="phone-preset">
+            <span>iPhone screen (optional)</span>
+            <select id="iphone-model">
+              <option value="">Custom / printed board</option>
+              <option value="iphone-15">iPhone 15</option>
+              <option value="iphone-15-plus">iPhone 15 Plus</option>
+              <option value="iphone-15-pro">iPhone 15 Pro</option>
+              <option value="iphone-15-pro-max">iPhone 15 Pro Max</option>
+              <option value="iphone-16">iPhone 16</option>
+              <option value="iphone-16-plus">iPhone 16 Plus</option>
+              <option value="iphone-16-pro">iPhone 16 Pro</option>
+              <option value="iphone-16-pro-max">iPhone 16 Pro Max</option>
+              <option value="iphone-17">iPhone 17</option>
+              <option value="iphone-17-pro">iPhone 17 Pro</option>
+              <option value="iphone-17-pro-max">iPhone 17 Pro Max</option>
+            </select>
+            <p class="hint" id="iphone-preset-hint">
+              Select a model if the board is a fullscreen checkerboard with
+              4×9 inner corners on that phone — corners and square size fill
+              in from the display size.
+            </p>
+          </label>
+
+          <fieldset class="board-inputs" id="board-inputs">
+            <legend>Checkerboard</legend>
+            <label>
+              <span>Inner corners (cols × rows)</span>
+              <span class="pair">
+                <input
+                  id="corners-cols"
+                  type="number"
+                  min="2"
+                  max="30"
+                  value="9"
+                  inputmode="numeric"
+                />
+                <span aria-hidden="true">×</span>
+                <input
+                  id="corners-rows"
+                  type="number"
+                  min="2"
+                  max="30"
+                  value="6"
+                  inputmode="numeric"
+                />
+              </span>
+            </label>
+            <label>
+              <span>Square size (mm)</span>
+              <input
+                id="square-mm"
+                type="number"
+                min="1"
+                step="0.1"
+                value="25"
+                inputmode="decimal"
+              />
+            </label>
+            <p class="hint">
+              Use <em>inner</em> corner counts (e.g. a 10×7 square board → 9×6
+              corners). Print the board flat and rigid. Avoid square grids like
+              8×8 — OpenCV often fails on those.
+            </p>
+            <div class="diag-actions">
+              <button id="selftest-btn" type="button">Test detector</button>
+              <button id="probe-btn" type="button" disabled>Probe live frame</button>
+            </div>
+            <img id="selftest-preview" class="selftest-preview" alt="" hidden />
+            <p id="selftest-result" class="hint selftest-result" hidden></p>
+          </fieldset>
+
+          <button id="start-btn" type="button">Start camera</button>
+          <button id="capture-btn" type="button" disabled>Start capture</button>
+          <button id="snap-btn" type="button" disabled>Capture now</button>
+          <button id="skip-btn" type="button" disabled>Skip pose</button>
+          <button id="compute-btn" type="button" disabled>Compute intrinsics</button>
+          <button id="reset-btn" type="button" disabled>Reset captures</button>
+          <button id="download-btn" type="button" disabled>Download JSON</button>
+
+          <p id="status" class="status">
+            Enter your board’s inner corner grid and square size, then start the
+            camera.
+          </p>
+
+          <div class="align-meter" aria-label="Alignment score">
+            <div class="align-meter-label">
+              <span>Alignment</span>
+              <output id="align-value">—</output>
+            </div>
+            <div class="align-meter-track">
+              <div id="align-bar" class="align-meter-bar" style="width: 0%"></div>
+            </div>
+            <p id="align-tip" class="align-tip">Board not detected yet</p>
+          </div>
+
+          <dl class="metrics">
+            <div>
+              <dt>Stage</dt>
+              <dd id="metric-stage">Setup</dd>
+            </div>
+            <div>
+              <dt>Pose</dt>
+              <dd id="metric-pose">—</dd>
+            </div>
+            <div>
+              <dt>Captures</dt>
+              <dd id="metric-captures">0 / 0</dd>
+            </div>
+            <div>
+              <dt>Board detected</dt>
+              <dd id="metric-detected">—</dd>
+            </div>
+            <div>
+              <dt>Detector</dt>
+              <dd id="metric-method">—</dd>
+            </div>
+            <div>
+              <dt>Position / size</dt>
+              <dd id="metric-align-parts">—</dd>
+            </div>
+            <div>
+              <dt>Hold progress</dt>
+              <dd id="metric-hold">—</dd>
+            </div>
+            <div>
+              <dt>Image size</dt>
+              <dd id="metric-size">—</dd>
+            </div>
+            <div>
+              <dt>RMS error</dt>
+              <dd id="metric-rms">—</dd>
+            </div>
+            <div>
+              <dt>HFOV / VFOV</dt>
+              <dd id="metric-fov">—</dd>
+            </div>
+          </dl>
+
+          <div class="thumbs" id="thumbs" aria-label="Captured frames"></div>
+        </aside>
+      </section>
+
+      <section class="results" id="results-panel" hidden>
+        <h2>Calibration results</h2>
+        <div class="results-grid">
+          <div>
+            <h3>Intrinsic matrix K</h3>
+            <pre id="matrix-k" class="mono"></pre>
+          </div>
+          <div>
+            <h3>Parameters</h3>
+            <pre id="params-out" class="mono"></pre>
+          </div>
+          <div>
+            <h3>Distortion</h3>
+            <pre id="dist-out" class="mono"></pre>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>
