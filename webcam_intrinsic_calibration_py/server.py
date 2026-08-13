@@ -130,10 +130,14 @@ def api_probe():
 
 
 def main():
+    """Dev entrypoint (`python server.py`). Prefer Gunicorn in production."""
     port = int(os.environ.get("PORT", "8767"))
     print(f"Webcam intrinsic calibration (Python OpenCV)")
     print(f"Open http://127.0.0.1:{port}")
-    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
+    # Deploy / LAN: bind all interfaces (PaaS, Docker, tunnels).
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+    # Local-only loopback:
+    # app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
 
 
 if __name__ == "__main__":

@@ -18,11 +18,20 @@ cd webcam_intrinsic_calibration_py
 python3 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-python server.py
+gunicorn -b 0.0.0.0:${PORT:-8767} -w 2 --threads 4 --timeout 120 server:app
+# Local Flask (no Gunicorn): python server.py
 # open http://127.0.0.1:8767
 ```
 
-Override port with `PORT=9000 python server.py`.
+Override port with `PORT=9000` (works for both Gunicorn and `python server.py`).
+
+## Deploy
+
+Webcam access needs **HTTPS** (or localhost). Use a host that terminates TLS (Railway, Render, Fly.io, etc.), or put Nginx/Caddy in front.
+
+- **Start command** (most PaaS): see `Procfile`, or the `gunicorn` line above with `$PORT`
+- **Docker**: `docker build -t webcam-calib . && docker run -p 8080:8080 -e PORT=8080 webcam-calib`
+- Root directory / workdir must be this folder so `import calib` resolves
 
 ## Board setup
 
@@ -71,4 +80,6 @@ Download via **Download JSON**.
 | `server.py` | Flask static server + JSON API |
 | `calib.py` | Python OpenCV detect / calibrate / FOV |
 | `static/` | Browser UI (webcam, poses, results) |
-| `requirements.txt` | flask, opencv-python-headless, numpy, Pillow |
+| `requirements.txt` | flask, gunicorn, opencv-python-headless, numpy, Pillow |
+| `Procfile` | PaaS start command (Gunicorn) |
+| `Dockerfile` | Container image (Gunicorn) |
