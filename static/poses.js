@@ -117,7 +117,7 @@ export const POSES = [
   {
     id: "tilt-up",
     title: "Tilt up",
-    instruction: "Tilt the top edge of the board away from the camera (~30–45°).",
+    instruction: "Tilt the top edge of the board away from the camera (~20–30°).",
     cx: 0.5,
     cy: 0.5,
     scale: 0.5,
@@ -126,7 +126,7 @@ export const POSES = [
   {
     id: "tilt-down",
     title: "Tilt down",
-    instruction: "Tilt the bottom edge of the board away from the camera (~30–45°).",
+    instruction: "Tilt the bottom edge of the board away from the camera (~20–30°).",
     cx: 0.5,
     cy: 0.5,
     scale: 0.5,
@@ -150,9 +150,18 @@ export const CAPTURE_COOLDOWN_MS = 700;
 export const ALIGN_SCORE_THRESHOLD = 75;
 /**
  * Minimum relative edge foreshortening to count as a tilt.
- * ~0.12 ≈ cos(30°) foreshortening on the far edge.
+ * ~0.12 ≈ cos(30°) foreshortening on the far (left/right) edge.
+ * Up/down uses a lower bar: a landscape board produces less vertical
+ * foreshortening at the same angle, and pitch is easier to clip out of frame.
  */
 export const TILT_RATIO_THRESHOLD = 0.12;
+export const TILT_RATIO_THRESHOLD_VERTICAL = 0.06;
+
+function tiltThreshold(expected) {
+  return expected === "up" || expected === "down"
+    ? TILT_RATIO_THRESHOLD_VERTICAL
+    : TILT_RATIO_THRESHOLD;
+}
 
 /**
  * Guide rectangle in pixel coords for a pose.
@@ -264,13 +273,12 @@ export function estimateBoardTilt(corners, cols, rows) {
   // Positive vertical ⇒ top edge shorter ⇒ top edge farther from camera
   const vertical = vMean > 1e-6 ? (bottomLen - topLen) / vMean : 0;
 
+  const hNorm = Math.abs(horizontal) / TILT_RATIO_THRESHOLD;
+  const vNorm = Math.abs(vertical) / TILT_RATIO_THRESHOLD_VERTICAL;
   let direction = null;
-  if (
-    Math.abs(horizontal) < TILT_RATIO_THRESHOLD &&
-    Math.abs(vertical) < TILT_RATIO_THRESHOLD
-  ) {
+  if (hNorm < 1 && vNorm < 1) {
     direction = "flat";
-  } else if (Math.abs(horizontal) >= Math.abs(vertical)) {
+  } else if (hNorm >= vNorm) {
     direction = horizontal > 0 ? "left" : "right";
   } else {
     direction = vertical > 0 ? "up" : "down";
@@ -292,26 +300,31 @@ export function estimateBoardTilt(corners, cols, rows) {
  * @param {'left'|'right'|'up'|'down'} expected
  */
 export function scoreTiltMatch(tilt, expected) {
-  const signed =
-    expected === "left" || expected === "right" ? tilt.horizontal : tilt.vertical;
+  const isVertical = expected === "up" || expected === "down";
+  const signed = isVertical ? tilt.vertical : tilt.horizontal;
   const wantPositive = expected === "left" || expected === "up";
   const correctSign = wantPositive ? signed > 0 : signed < 0;
   const magnitude = Math.abs(signed);
-  const primary =
-    expected === "left" || expected === "right"
-      ? Math.abs(tilt.horizontal) >= Math.abs(tilt.vertical) * 0.85
-      : Math.abs(tilt.vertical) >= Math.abs(tilt.horizontal) * 0.85;
+  const threshold = tiltThreshold(expected);
+  const other = isVertical ? Math.abs(tilt.horizontal) : Math.abs(tilt.vertical);
+  const otherThreshold = isVertical
+    ? TILT_RATIO_THRESHOLD
+    : TILT_RATIO_THRESHOLD_VERTICAL;
+  const primary = magnitude / threshold >= (other / otherThreshold) * 0.85;
 
-  const ok =
-    correctSign && primary && magnitude >= TILT_RATIO_THRESHOLD;
+  const ok = correctSign && primary && magnitude >= threshold;
 
-  // Map magnitude 0→threshold→~0.35 into 0–100
+  // Map magnitude so a just-accepted tilt scores high enough to auto-capture
+  // with decent position/size (ALIGN_SCORE_THRESHOLD weights tilt at 50%).
+  const span = isVertical ? threshold * 1.05 : 0.28;
+  const floor = isVertical ? threshold * 0.15 : TILT_RATIO_THRESHOLD * 0.25;
   const tiltScore = Math.max(
     0,
-    Math.min(100, ((magnitude - TILT_RATIO_THRESHOLD * 0.25) / 0.28) * 100)
+    Math.min(100, ((magnitude - floor) / span) * 100)
   );
 
   let tip = "Hold steady";
+  const angleHint = isVertical ? "~20–30°" : "~30–45°";
   if (!correctSign || tilt.direction === "flat") {
     const labels = {
       left: "left edge away from the camera",
@@ -322,10 +335,10 @@ export function scoreTiltMatch(tilt, expected) {
     tip =
       tilt.direction && tilt.direction !== "flat" && tilt.direction !== expected
         ? `Wrong tilt (${tilt.direction}) — tilt the ${labels[expected]}`
-        : `Tilt the ${labels[expected]} more (~30–45°)`;
+        : `Tilt the ${labels[expected]} more (${angleHint})`;
   } else if (!primary) {
     tip = `Tilt more ${expected} (reduce the other axis)`;
-  } else if (magnitude < TILT_RATIO_THRESHOLD) {
+  } else if (magnitude < threshold) {
     tip = `Tilt ${expected} a bit more`;
   } else {
     tip = "Good tilt — hold still";
