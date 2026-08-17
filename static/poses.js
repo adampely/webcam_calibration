@@ -143,8 +143,8 @@ export const POSES = [
 ];
 
 export const MIN_CAPTURES_TO_COMPUTE = 10;
-/** ~6 detections × 100ms ≈ 0.6s hold once aligned */
-export const STABLE_FRAMES_REQUIRED = 6;
+/** ~5 preview detections while holding ≈ 0.5–1s once aligned; then one full-res capture */
+export const STABLE_FRAMES_REQUIRED = 5;
 export const CAPTURE_COOLDOWN_MS = 700;
 /** Auto-capture when alignment score reaches this (0–100) */
 export const ALIGN_SCORE_THRESHOLD = 75;

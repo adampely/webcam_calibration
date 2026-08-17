@@ -143,14 +143,21 @@ let lastDetect = null;
 let lastDetectAt = 0;
 
 /**
- * Live /api/detect streaming knobs (not used by /api/calibrate).
- * Localhost stays snappy; remote hosts throttle bandwidth + rate for Deploy/Render.
+ * /api/detect JPEG tiers (corners scaled back to full video size).
+ * - preview: low-res alignment while moving into pose (capture session only)
+ * - standard: default live detect / probe
+ * - capture: full camera resolution for saved corners + calibrate
+ *
+ * Localhost stays snappy; remote hosts throttle interval + standard-tier size.
  * Interval may rise further from measured detect RTT (see adaptDetectFromLatency).
  */
+const DETECT_TIERS = {
+  preview: { maxWidth: 320, jpegQuality: 0.5 },
+  standard: { maxWidth: 1280, jpegQuality: 0.6 },
+  capture: { maxWidth: Infinity, jpegQuality: 0.92 },
+};
 const DETECT_LOCAL = {
   intervalMs: 120,
-  maxWidth: 1280,
-  jpegQuality: 0.85,
 };
 const DETECT_REMOTE = {
   intervalMs: 280,
@@ -175,8 +182,6 @@ const DETECT_BASE = IS_LOCAL_HOST ? DETECT_LOCAL : DETECT_REMOTE;
 
 /** Mutable; remote may raise intervalMs from RTT. */
 let detectIntervalMs = DETECT_BASE.intervalMs;
-let maxDetectWidth = DETECT_BASE.maxWidth;
-const detectJpegQuality = DETECT_BASE.jpegQuality;
 /** @type {number | null} EMA of /api/detect round-trip (ms). */
 let detectRttEma = null;
 
@@ -283,14 +288,33 @@ function frameThumbUrl() {
 }
 
 /**
- * Capture a JPEG blob of the current video frame (downscaled for detect/probe).
- * Uses maxDetectWidth / detectJpegQuality — not full-res capture quality.
+ * JPEG encode settings for a detect tier (remote standard tier uses smaller JPEGs).
+ * @param {'preview'|'standard'|'capture'} tier
+ */
+function detectTierOpts(tier) {
+  const base = DETECT_TIERS[tier] || DETECT_TIERS.standard;
+  if (tier === "capture" || tier === "preview" || IS_LOCAL_HOST) return base;
+  if (tier === "standard") {
+    return {
+      maxWidth: Math.min(base.maxWidth, DETECT_REMOTE.maxWidth),
+      jpegQuality: DETECT_REMOTE.jpegQuality,
+    };
+  }
+  return base;
+}
+
+/**
+ * Capture a JPEG blob of the current video frame for /api/detect or probe.
+ * @param {{ maxWidth?: number, jpegQuality?: number }} [opts]
  * @returns {Promise<Blob>}
  */
-function frameJpegBlob() {
+function frameJpegBlob(opts = DETECT_TIERS.standard) {
   const vw = video.videoWidth;
   const vh = video.videoHeight;
-  const scale = vw > maxDetectWidth ? maxDetectWidth / vw : 1;
+  const limit = opts.maxWidth ?? DETECT_TIERS.standard.maxWidth;
+  const jpegQuality = opts.jpegQuality ?? DETECT_TIERS.standard.jpegQuality;
+  const maxW = Number.isFinite(limit) ? limit : vw;
+  const scale = vw > maxW ? maxW / vw : 1;
   const c = document.createElement("canvas");
   c.width = Math.round(vw * scale);
   c.height = Math.round(vh * scale);
@@ -300,7 +324,7 @@ function frameJpegBlob() {
     c.toBlob(
       (blob) => (blob ? resolve(blob) : reject(new Error("Failed to encode frame"))),
       "image/jpeg",
-      detectJpegQuality
+      jpegQuality
     );
   });
 }
@@ -354,10 +378,13 @@ function scaleDetectToVideo(detect, jpegW, jpegH) {
   };
 }
 
-async function apiDetect(cols, rows, squareMm) {
-  const blob = await frameJpegBlob();
-  const jpegW =
-    video.videoWidth > maxDetectWidth ? maxDetectWidth : video.videoWidth;
+async function apiDetect(cols, rows, squareMm, tier = "standard") {
+  const opts = detectTierOpts(tier);
+  const blob = await frameJpegBlob(opts);
+  const jpegW = Math.min(
+    video.videoWidth,
+    Number.isFinite(opts.maxWidth) ? opts.maxWidth : video.videoWidth
+  );
   const jpegH = Math.round(video.videoHeight * (jpegW / video.videoWidth));
 
   const form = new FormData();
@@ -371,6 +398,26 @@ async function apiDetect(cols, rows, squareMm) {
   adaptDetectFromLatency(performance.now() - t0);
   if (!res.ok) throw new Error(data.error || res.statusText);
   return scaleDetectToVideo(data, jpegW, jpegH);
+}
+
+/**
+ * Score alignment for the current pose from a detect result.
+ * @param {object} detect
+ * @param {{cols:number,rows:number,squareMm:number}} cfg
+ */
+function alignForDetect(detect, cfg) {
+  if (!detect.found || !detect.centroid || !detect.corners) return null;
+  const pose = capturing ? currentPose() : null;
+  if (!pose) return null;
+  return scoreAlignment(
+    detect.centroid,
+    detect.corners,
+    pose,
+    detect.width,
+    detect.height,
+    cfg.cols,
+    cfg.rows
+  );
 }
 
 /**
@@ -926,8 +973,16 @@ async function manualSnap() {
     return;
   }
   snapBtn.disabled = true;
-  await tryAcceptCapture(lastDetect);
-  snapBtn.disabled = !(capturing && lastDetect?.found);
+  try {
+    const cfg = boardConfig();
+    const detect = await apiDetect(cfg.cols, cfg.rows, cfg.squareMm, "capture");
+    const align = alignForDetect(detect, cfg);
+    await tryAcceptCapture({ ...detect, align });
+  } catch (err) {
+    setStatus(`Capture failed: ${err.message || err}`, true);
+  } finally {
+    snapBtn.disabled = !(capturing && lastDetect?.found);
+  }
 }
 
 async function tick() {
@@ -961,23 +1016,10 @@ async function tick() {
   detecting = true;
   lastDetectAt = now;
   try {
-    const detect = await apiDetect(cfg.cols, cfg.rows, cfg.squareMm);
+    const detectTier = capturing ? "preview" : "standard";
+    const detect = await apiDetect(cfg.cols, cfg.rows, cfg.squareMm, detectTier);
 
-    let align = null;
-    if (detect.found && detect.centroid && detect.corners) {
-      const pose = capturing ? currentPose() : null;
-      if (pose) {
-        align = scoreAlignment(
-          detect.centroid,
-          detect.corners,
-          pose,
-          detect.width,
-          detect.height,
-          cfg.cols,
-          cfg.rows
-        );
-      }
-    }
+    const align = alignForDetect(detect, cfg);
 
     lastDetect = { ...detect, align };
     snapBtn.disabled = !(capturing && detect.found);
@@ -1012,7 +1054,24 @@ async function tick() {
           remain > 0 ? "warn" : "ok"
         );
         if (stableCount >= STABLE_FRAMES_REQUIRED) {
-          await tryAcceptCapture({ ...detect, align });
+          const captureDetect = await apiDetect(
+            cfg.cols,
+            cfg.rows,
+            cfg.squareMm,
+            "capture"
+          );
+          const captureAlign = alignForDetect(captureDetect, cfg) || align;
+          if (!captureDetect.found || !captureDetect.corners) {
+            stableCount = 0;
+            metricHold.textContent = `0 / ${STABLE_FRAMES_REQUIRED}`;
+            setBadge("Full-res detect failed — hold steady", "warn");
+            setStatus(
+              "Board lost at full resolution — adjust and hold steady again.",
+              true
+            );
+          } else {
+            await tryAcceptCapture({ ...captureDetect, align: captureAlign });
+          }
         }
       }
     } else if (capturing) {
@@ -1123,7 +1182,7 @@ probeBtn.addEventListener("click", async () => {
   setStatus("Probing common board sizes on the current frame…");
   try {
     const cfg = boardConfig();
-    const blob = await frameJpegBlob();
+    const blob = await frameJpegBlob(detectTierOpts("standard"));
     const form = new FormData();
     form.append("image", blob, "frame.jpg");
     form.append("cols", String(cfg.cols));
