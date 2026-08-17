@@ -147,13 +147,55 @@ let lastDetectAt = 0;
  * - preview: low-res alignment while moving into pose (capture session only)
  * - standard: default live detect / probe
  * - capture: full camera resolution for saved corners + calibrate
+ *
+ * Localhost stays snappy; remote hosts throttle interval + standard-tier size.
+ * Interval may rise further from measured detect RTT (see adaptDetectFromLatency).
  */
 const DETECT_TIERS = {
   preview: { maxWidth: 320, jpegQuality: 0.5 },
   standard: { maxWidth: 1280, jpegQuality: 0.6 },
   capture: { maxWidth: Infinity, jpegQuality: 0.92 },
 };
-const DETECT_INTERVAL_MS = 120;
+const DETECT_LOCAL = {
+  intervalMs: 120,
+};
+const DETECT_REMOTE = {
+  intervalMs: 280,
+  maxWidth: 640,
+  jpegQuality: 0.6,
+  /** Cap when adapting to high RTT (ms). */
+  intervalCapMs: 700,
+};
+
+function isLocalHost() {
+  const h = location.hostname;
+  return (
+    h === "localhost" ||
+    h === "127.0.0.1" ||
+    h === "[::1]" ||
+    h === "::1"
+  );
+}
+
+const IS_LOCAL_HOST = isLocalHost();
+const DETECT_BASE = IS_LOCAL_HOST ? DETECT_LOCAL : DETECT_REMOTE;
+
+/** Mutable; remote may raise intervalMs from RTT. */
+let detectIntervalMs = DETECT_BASE.intervalMs;
+/** @type {number | null} EMA of /api/detect round-trip (ms). */
+let detectRttEma = null;
+
+function adaptDetectFromLatency(rttMs) {
+  if (IS_LOCAL_HOST || !Number.isFinite(rttMs) || rttMs < 0) return;
+  detectRttEma =
+    detectRttEma == null ? rttMs : detectRttEma * 0.7 + rttMs * 0.3;
+  // Keep roughly one in-flight cadence: don't poll much faster than RTT.
+  const target = Math.round(detectRttEma * 1.15);
+  detectIntervalMs = Math.min(
+    DETECT_REMOTE.intervalCapMs,
+    Math.max(DETECT_REMOTE.intervalMs, target)
+  );
+}
 
 /** @type {{ corners: number[], thumbUrl: string, poseId: string, pose?: object }[]} */
 let captures = [];
@@ -246,11 +288,19 @@ function frameThumbUrl() {
 }
 
 /**
- * JPEG encode settings for a detect tier.
+ * JPEG encode settings for a detect tier (remote standard tier uses smaller JPEGs).
  * @param {'preview'|'standard'|'capture'} tier
  */
 function detectTierOpts(tier) {
-  return DETECT_TIERS[tier] || DETECT_TIERS.standard;
+  const base = DETECT_TIERS[tier] || DETECT_TIERS.standard;
+  if (tier === "capture" || tier === "preview" || IS_LOCAL_HOST) return base;
+  if (tier === "standard") {
+    return {
+      maxWidth: Math.min(base.maxWidth, DETECT_REMOTE.maxWidth),
+      jpegQuality: DETECT_REMOTE.jpegQuality,
+    };
+  }
+  return base;
 }
 
 /**
@@ -342,8 +392,10 @@ async function apiDetect(cols, rows, squareMm, tier = "standard") {
   form.append("cols", String(cols));
   form.append("rows", String(rows));
   form.append("squareMm", String(squareMm));
+  const t0 = performance.now();
   const res = await fetch("/api/detect", { method: "POST", body: form });
   const data = await res.json();
+  adaptDetectFromLatency(performance.now() - t0);
   if (!res.ok) throw new Error(data.error || res.statusText);
   return scaleDetectToVideo(data, jpegW, jpegH);
 }
@@ -946,7 +998,7 @@ async function tick() {
   }
 
   const now = performance.now();
-  const dueForDetect = !detecting && now - lastDetectAt >= DETECT_INTERVAL_MS;
+  const dueForDetect = !detecting && now - lastDetectAt >= detectIntervalMs;
 
   if (!dueForDetect) {
     drawOverlay(lastDetect);
@@ -1130,7 +1182,7 @@ probeBtn.addEventListener("click", async () => {
   setStatus("Probing common board sizes on the current frame…");
   try {
     const cfg = boardConfig();
-    const blob = await frameJpegBlob();
+    const blob = await frameJpegBlob(detectTierOpts("standard"));
     const form = new FormData();
     form.append("image", blob, "frame.jpg");
     form.append("cols", String(cfg.cols));
