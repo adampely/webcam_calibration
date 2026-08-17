@@ -14,7 +14,7 @@ Server: full Python OpenCV (`findChessboardCorners`, `cornerSubPix`, `calibrateC
 ## Run
 
 ```bash
-cd webcam_intrinsic_calibration_py
+cd webcam_calibration
 python3 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
@@ -32,6 +32,10 @@ Webcam access needs **HTTPS** (or localhost). Use a host that terminates TLS (Ra
 - **Start command** (most PaaS): see `Procfile`, or the `gunicorn` line above with `$PORT`
 - **Docker**: `docker build -t webcam-calib . && docker run -p 8080:8080 -e PORT=8080 webcam-calib`
 - Root directory / workdir must be this folder so `import calib` resolves
+
+### Detect streaming (bandwidth)
+
+Live board detection posts JPEG frames to `/api/detect`. On **localhost** the client uses snappy settings (≈120 ms interval, max width 1280, JPEG quality 0.85). On a **remote** host it throttles (≈280 ms base interval, max width 640, quality 0.6) and may raise the interval further if detect RTT is high (capped at 700 ms). Calibration (`/api/calibrate`) still uses full-resolution corner lists from captures — only the live detect stream is reduced. Tunables: `DETECT_LOCAL` / `DETECT_REMOTE` in `static/app.js`.
 
 ## Board setup
 

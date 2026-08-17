@@ -141,8 +141,57 @@ let animFrameId = null;
 let detecting = false;
 let lastDetect = null;
 let lastDetectAt = 0;
-const DETECT_INTERVAL_MS = 120;
-const MAX_DETECT_WIDTH = 1280;
+
+/**
+ * Live /api/detect streaming knobs (not used by /api/calibrate).
+ * Localhost stays snappy; remote hosts throttle bandwidth + rate for Deploy/Render.
+ * Interval may rise further from measured detect RTT (see adaptDetectFromLatency).
+ */
+const DETECT_LOCAL = {
+  intervalMs: 120,
+  maxWidth: 1280,
+  jpegQuality: 0.85,
+};
+const DETECT_REMOTE = {
+  intervalMs: 280,
+  maxWidth: 640,
+  jpegQuality: 0.6,
+  /** Cap when adapting to high RTT (ms). */
+  intervalCapMs: 700,
+};
+
+function isLocalHost() {
+  const h = location.hostname;
+  return (
+    h === "localhost" ||
+    h === "127.0.0.1" ||
+    h === "[::1]" ||
+    h === "::1"
+  );
+}
+
+const IS_LOCAL_HOST = isLocalHost();
+const DETECT_BASE = IS_LOCAL_HOST ? DETECT_LOCAL : DETECT_REMOTE;
+
+/** Mutable; remote may raise intervalMs from RTT. */
+let detectIntervalMs = DETECT_BASE.intervalMs;
+let maxDetectWidth = DETECT_BASE.maxWidth;
+const detectJpegQuality = DETECT_BASE.jpegQuality;
+/** @type {number | null} EMA of /api/detect round-trip (ms). */
+let detectRttEma = null;
+
+function adaptDetectFromLatency(rttMs) {
+  if (IS_LOCAL_HOST || !Number.isFinite(rttMs) || rttMs < 0) return;
+  detectRttEma =
+    detectRttEma == null ? rttMs : detectRttEma * 0.7 + rttMs * 0.3;
+  // Keep roughly one in-flight cadence: don't poll much faster than RTT.
+  const target = Math.round(detectRttEma * 1.15);
+  detectIntervalMs = Math.min(
+    DETECT_REMOTE.intervalCapMs,
+    Math.max(DETECT_REMOTE.intervalMs, target)
+  );
+}
+
 /** @type {{ corners: number[], thumbUrl: string, poseId: string, pose?: object }[]} */
 let captures = [];
 /** @type {object | null} */
@@ -234,13 +283,14 @@ function frameThumbUrl() {
 }
 
 /**
- * Capture a JPEG blob of the current video frame (downscaled for API).
+ * Capture a JPEG blob of the current video frame (downscaled for detect/probe).
+ * Uses maxDetectWidth / detectJpegQuality — not full-res capture quality.
  * @returns {Promise<Blob>}
  */
 function frameJpegBlob() {
   const vw = video.videoWidth;
   const vh = video.videoHeight;
-  const scale = vw > MAX_DETECT_WIDTH ? MAX_DETECT_WIDTH / vw : 1;
+  const scale = vw > maxDetectWidth ? maxDetectWidth / vw : 1;
   const c = document.createElement("canvas");
   c.width = Math.round(vw * scale);
   c.height = Math.round(vh * scale);
@@ -250,7 +300,7 @@ function frameJpegBlob() {
     c.toBlob(
       (blob) => (blob ? resolve(blob) : reject(new Error("Failed to encode frame"))),
       "image/jpeg",
-      0.85
+      detectJpegQuality
     );
   });
 }
@@ -307,7 +357,7 @@ function scaleDetectToVideo(detect, jpegW, jpegH) {
 async function apiDetect(cols, rows, squareMm) {
   const blob = await frameJpegBlob();
   const jpegW =
-    video.videoWidth > MAX_DETECT_WIDTH ? MAX_DETECT_WIDTH : video.videoWidth;
+    video.videoWidth > maxDetectWidth ? maxDetectWidth : video.videoWidth;
   const jpegH = Math.round(video.videoHeight * (jpegW / video.videoWidth));
 
   const form = new FormData();
@@ -315,8 +365,10 @@ async function apiDetect(cols, rows, squareMm) {
   form.append("cols", String(cols));
   form.append("rows", String(rows));
   form.append("squareMm", String(squareMm));
+  const t0 = performance.now();
   const res = await fetch("/api/detect", { method: "POST", body: form });
   const data = await res.json();
+  adaptDetectFromLatency(performance.now() - t0);
   if (!res.ok) throw new Error(data.error || res.statusText);
   return scaleDetectToVideo(data, jpegW, jpegH);
 }
@@ -891,7 +943,7 @@ async function tick() {
   }
 
   const now = performance.now();
-  const dueForDetect = !detecting && now - lastDetectAt >= DETECT_INTERVAL_MS;
+  const dueForDetect = !detecting && now - lastDetectAt >= detectIntervalMs;
 
   if (!dueForDetect) {
     drawOverlay(lastDetect);
